@@ -305,17 +305,8 @@ class OCRWorker(QThread):
                 frame = cv2.resize(frame, (new_width, new_height))
             
             # Use intelligent OCR with region focus - Spanish only
-            ocr_kwargs = {
-                'paragraph': False,
-                'width_ths': 0.7,
-                'height_ths': 0.7,
-            }
-
             allowlist = self._get_allowlist_for_language()
-            if allowlist:
-                ocr_kwargs['allowlist'] = allowlist
-
-            results = self.reader.readtext(frame, **ocr_kwargs)
+            results = self._perform_ocr(frame, allowlist)
             
             if not results:
                 self.is_processing = False
@@ -706,7 +697,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("Field Translator - Optimized")
         self.video_label = QLabel()
-        self.video_label.setFixedSize(800, 600)
+        self.video_label.setFixedSize(640, 480)
         self.video_label.setScaledContents(True)  # Scale to fit the label
 
         # HUD configuration for wearable display
@@ -717,10 +708,10 @@ class MainWindow(QMainWindow):
 
         self.text_spanish = QTextEdit()
         self.text_spanish.setReadOnly(True)
-        self.text_spanish.setMaximumHeight(100)
+        self.text_spanish.setMaximumHeight(80)
         self.text_english = QTextEdit()
         self.text_english.setReadOnly(True)
-        self.text_english.setMaximumHeight(100)
+        self.text_english.setMaximumHeight(80)
 
         self.btn_toggle = QPushButton("Pause OCR")
         self.btn_toggle.clicked.connect(self.toggle_ocr)
@@ -743,11 +734,11 @@ class MainWindow(QMainWindow):
         # Frame skip controls
         self.frame_skip_slider = QSlider(Qt.Horizontal)
         self.frame_skip_slider.setMinimum(1)
-        self.frame_skip_slider.setMaximum(10)
-        self.frame_skip_slider.setValue(5)  # Higher default for better performance
+        self.frame_skip_slider.setMaximum(120)
+        self.frame_skip_slider.setValue(60)
         self.frame_skip_slider.valueChanged.connect(self.update_frame_skip)
         
-        self.frame_skip_label = QLabel("Process every 5 frames")
+        self.frame_skip_label = QLabel("Process every 60 frames")
         
         # Language selection
         self.language_combo = QComboBox()
@@ -825,6 +816,7 @@ class MainWindow(QMainWindow):
         container = QWidget()
         container.setLayout(layout)
         self.setCentralWidget(container)
+        self.resize(780, 760)
 
         # Camera setup
         self.cap = cv2.VideoCapture(0)
@@ -845,7 +837,7 @@ class MainWindow(QMainWindow):
         # Performance tracking
         self.frame_count = 0
         self.process_count = 0
-        self.frame_skip = 5  # Updated default
+        self.frame_skip = 60
         self.last_fps_time = 0
         self.fps_counter = 0
         self.processing_status = "Ready"
