@@ -4,9 +4,16 @@ import numpy as np
 from PySide6.QtWidgets import QApplication, QLabel, QMainWindow, QVBoxLayout, QWidget, QPushButton, QTextEdit, QSlider, QHBoxLayout, QCheckBox, QComboBox
 from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtCore import QTimer, Qt, QThread, Signal, QMutex
-from transformers import MarianMTModel, MarianTokenizer
+from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 import time
 import threading
+
+try:
+    from paddleocr import PaddleOCR
+    PADDLE_AVAILABLE = True
+except ImportError:
+    PaddleOCR = None
+    PADDLE_AVAILABLE = False
 
 # -------------------------------
 # OCR + Translation Worker Thread
@@ -72,6 +79,28 @@ class OCRWorker(QThread):
 
     def initialize_reader(self):
         """Initialize OCR reader for current language"""
+        self.reader = None
+        self.paddle_reader = None
+
+        preferred_engine = self.ocr_engine_preference
+        if preferred_engine == 'auto':
+            preferred_engine = 'paddle' if PADDLE_AVAILABLE else 'easy'
+
+        if preferred_engine == 'paddle' and PADDLE_AVAILABLE:
+            try:
+                paddle_lang = self._map_paddle_language(self.current_language)
+                self.paddle_reader = PaddleOCR(
+                    lang=paddle_lang,
+                    use_angle_cls=True,
+                    use_gpu=torch.cuda.is_available(),
+                    show_log=False
+                )
+                self.active_engine = 'paddle'
+                return
+            except Exception as e:
+                print(f"Error initializing PaddleOCR: {e}")
+                self.paddle_reader = None
+
         try:
             easyocr_language = self._map_language_code(self.current_language)
             use_cuda = torch.cuda.is_available()
@@ -83,10 +112,12 @@ class OCRWorker(QThread):
                 model_storage_directory='./models',
                 download_enabled=True
             )
+            self.active_engine = 'easy'
         except Exception as e:
-            print(f"Error initializing OCR reader: {e}")
+            print(f"Error initializing EasyOCR reader: {e}")
             # Fallback to English if language not supported
             self.reader = easyocr.Reader(['en'], gpu=False, verbose=False)
+            self.active_engine = 'easy'
 
     def _map_language_code(self, language_code):
         """Map internal language code to EasyOCR specific code"""
@@ -96,6 +127,23 @@ class OCRWorker(QThread):
             'ko': 'ko',
         }
         return mapping.get(language_code, language_code)
+
+    def _map_paddle_language(self, language_code):
+        """Map internal language code to PaddleOCR language codes"""
+        mapping = {
+            'es': 'spanish',
+            'fr': 'french',
+            'de': 'german',
+            'it': 'italian',
+            'pt': 'portuguese',
+            'ru': 'russian',
+            'zh': 'ch',
+            'ja': 'japan',
+            'ko': 'korean',
+            'ar': 'arabic',
+            'en': 'en',
+        }
+        return mapping.get(language_code, 'en')
 
     def _get_allowlist_for_language(self):
         """Return per-language allowlist, if applicable"""
@@ -156,6 +204,14 @@ class OCRWorker(QThread):
             # Clear history when changing languages
             self.text_history = []
             self.last_text = ""
+
+    def change_ocr_engine(self, engine_key):
+        """Switch between available OCR engines"""
+        valid = {'auto', 'paddle', 'easy'}
+        if engine_key not in valid:
+            return
+        self.ocr_engine_preference = engine_key
+        self.initialize_reader()
 
     def calculate_similarity(self, text1, text2):
         """Calculate simple text similarity to avoid reprocessing similar text"""
@@ -313,6 +369,45 @@ class OCRWorker(QThread):
                 
         self.last_regions = text_regions
         return True
+
+    def _perform_ocr(self, frame, allowlist):
+        """Run OCR using the active engine and normalize output"""
+        if self.active_engine == 'paddle' and self.paddle_reader is not None:
+            try:
+                raw_results = self.paddle_reader.ocr(frame, cls=True)
+            except Exception as e:
+                print(f"PaddleOCR error: {e}")
+                raw_results = []
+
+            normalized = []
+            for line in raw_results or []:
+                for entry in line:
+                    if len(entry) < 2:
+                        continue
+                    bbox, text_info = entry
+                    text, conf = text_info
+                    if not text:
+                        continue
+                    bbox_int = [[int(pt[0]), int(pt[1])] for pt in bbox]
+                    normalized.append((bbox_int, text, float(conf)))
+            return normalized
+
+        if self.reader is not None:
+            ocr_kwargs = {
+                'paragraph': False,
+                'width_ths': 0.7,
+                'height_ths': 0.7,
+            }
+            if allowlist:
+                ocr_kwargs['allowlist'] = allowlist
+
+            try:
+                return self.reader.readtext(frame, **ocr_kwargs)
+            except Exception as e:
+                print(f"EasyOCR error: {e}")
+                return []
+
+        return []
 
     def _filter_results_intelligently(self, results):
         """Intelligent filtering of OCR results"""
@@ -698,6 +793,15 @@ class MainWindow(QMainWindow):
         lang_layout.addWidget(QLabel("Language:"))
         lang_layout.addWidget(self.language_combo)
         layout.addLayout(lang_layout)
+
+        # OCR engine selection
+        self.ocr_engine_combo = QComboBox()
+        self.ocr_engine_combo.addItems(["Automatic", "PaddleOCR", "EasyOCR"])
+        self.ocr_engine_combo.currentTextChanged.connect(self.handle_ocr_engine_change)
+        ocr_layout = QHBoxLayout()
+        ocr_layout.addWidget(QLabel("OCR Engine:"))
+        ocr_layout.addWidget(self.ocr_engine_combo)
+        layout.addLayout(ocr_layout)
         
         # Smart processing controls
         smart_layout = QHBoxLayout()
@@ -804,6 +908,15 @@ class MainWindow(QMainWindow):
     def update_frame_skip(self, value):
         self.frame_skip = value
         self.frame_skip_label.setText(f"Process every {value} frames")
+
+    def handle_ocr_engine_change(self, text):
+        mapping = {
+            "Automatic": 'auto',
+            "PaddleOCR": 'paddle',
+            "EasyOCR": 'easy',
+        }
+        engine_key = mapping.get(text, 'auto')
+        self.ocr_worker.change_ocr_engine(engine_key)
 
     def toggle_smart_processing(self, state):
         """Toggle intelligent processing features"""
