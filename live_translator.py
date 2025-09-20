@@ -57,7 +57,8 @@ class OCRWorker(QThread):
             'zh': 'zho_Hans',
             'ja': 'jpn_Jpan',
             'ko': 'kor_Hang',
-            'ar': 'arb_Arab'
+            'ar': 'arb_Arab',
+            'en': 'eng_Latn'
         }
         self.tokenizer = None
         self.model = None
@@ -84,6 +85,7 @@ class OCRWorker(QThread):
         self.text_regions = []
         self.region_stability_threshold = 3
         self.stable_regions = {}
+        self.translation_mutex = QMutex()
 
     def run(self):
         pass  # worker triggered externally
@@ -350,7 +352,7 @@ class OCRWorker(QThread):
             self.last_text = spanish_text
             
             # Fast translation with caching
-            english_text = self._translate_fast(spanish_text)
+            english_text = self._translate_fast(spanish_text, self.current_language)
             if english_text:
                 self.result_ready.emit(spanish_text, english_text)
                 
@@ -645,7 +647,7 @@ class OCRWorker(QThread):
         arabic_chars = set('ابتثجحخدذرزسشصضطظعغفقكلمنهوي')
         return self._has_language_character_support(text, arabic_chars, min_ratio=0.3, min_matches=1)
 
-    def _translate_fast(self, text):
+    def _translate_fast(self, text, language_code=None):
         """Fast translation with error handling and better accuracy"""
         try:
             if self.tokenizer is None or self.model is None:
@@ -655,35 +657,37 @@ class OCRWorker(QThread):
             if len(text) > 400:
                 text = text[:400]
 
-            source_code = self.nllb_language_codes.get(self.current_language, 'eng_Latn')
+            source_lang = language_code or self.current_language
+            source_code = self.nllb_language_codes.get(source_lang, 'eng_Latn')
             target_code = 'eng_Latn'
 
-            self.tokenizer.src_lang = source_code
+            with QMutexLocker(self.translation_mutex):
+                self.tokenizer.src_lang = source_code
 
-            tokens = self.tokenizer(
-                text,
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
-                max_length=256,
-            )
-            tokens = {k: v.to(self.translation_device) for k, v in tokens.items()}
+                tokens = self.tokenizer(
+                    text,
+                    return_tensors="pt",
+                    padding=True,
+                    truncation=True,
+                    max_length=256,
+                )
+                tokens = {k: v.to(self.translation_device) for k, v in tokens.items()}
 
-            generation_kwargs = {
-                "max_length": 256,
-                "num_beams": 3,
-                "early_stopping": True,
-                "repetition_penalty": 1.05,
-            }
+                generation_kwargs = {
+                    "max_length": 256,
+                    "num_beams": 3,
+                    "early_stopping": True,
+                    "repetition_penalty": 1.05,
+                }
 
-            if hasattr(self.tokenizer, "lang_code_to_id") and target_code in self.tokenizer.lang_code_to_id:
-                generation_kwargs["forced_bos_token_id"] = self.tokenizer.lang_code_to_id[target_code]
+                if hasattr(self.tokenizer, "lang_code_to_id") and target_code in self.tokenizer.lang_code_to_id:
+                    generation_kwargs["forced_bos_token_id"] = self.tokenizer.lang_code_to_id[target_code]
 
-            with torch.no_grad():
-                translated = self.model.generate(**tokens, **generation_kwargs)
+                with torch.no_grad():
+                    translated = self.model.generate(**tokens, **generation_kwargs)
 
-            english_text = self.tokenizer.batch_decode(translated, skip_special_tokens=True)[0]
-            
+                english_text = self.tokenizer.batch_decode(translated, skip_special_tokens=True)[0]
+
             # Clean up the translation
             english_text = english_text.strip()
             if english_text and english_text != text:  # Make sure it's actually translated
