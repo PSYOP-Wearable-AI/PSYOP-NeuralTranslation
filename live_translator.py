@@ -22,23 +22,30 @@ class OCRWorker(QThread):
         # Language settings
         self.current_language = 'es'
         self.reader = None
+        self.paddle_reader = None
+        self.active_engine = 'easy'
+        self.ocr_engine_preference = 'auto'
         self.initialize_reader()
         
-        # Initialize translation model
-        self.translation_models = {
-            'es': "Helsinki-NLP/opus-mt-es-en",
-            'fr': "Helsinki-NLP/opus-mt-fr-en",
-            'de': "Helsinki-NLP/opus-mt-de-en",
-            'it': "Helsinki-NLP/opus-mt-it-en",
-            'pt': "Helsinki-NLP/opus-mt-pt-en",
-            'ru': "Helsinki-NLP/opus-mt-ru-en",
-            'zh': "Helsinki-NLP/opus-mt-zh-en",
-            'ja': "Helsinki-NLP/opus-mt-ja-en",
-            'ko': "Helsinki-NLP/opus-mt-ko-en",
-            'ar': "Helsinki-NLP/opus-mt-ar-en"
+        # Initialize NLLB translation model configuration
+        self.nllb_model_name = "facebook/nllb-200-distilled-600M"
+        self.nllb_language_codes = {
+            'es': 'spa_Latn',
+            'fr': 'fra_Latn',
+            'de': 'deu_Latn',
+            'it': 'ita_Latn',
+            'pt': 'por_Latn',
+            'ru': 'rus_Cyrl',
+            'zh': 'zho_Hans',
+            'ja': 'jpn_Jpan',
+            'ko': 'kor_Hang',
+            'ar': 'arb_Arab'
         }
         self.tokenizer = None
         self.model = None
+        self.translation_device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available() and not torch.cuda.is_available():
+            self.translation_device = torch.device('mps')
         self.initialize_translation_model()
         
         # Performance settings
@@ -111,36 +118,34 @@ class OCRWorker(QThread):
         return allowlists.get(self.current_language, latin_base + common_symbols)
 
     def initialize_translation_model(self):
-        """Initialize translation model for current language"""
+        """Initialize the shared NLLB translation model"""
+        if self.tokenizer is not None and self.model is not None:
+            return
+
         try:
-            if self.current_language in self.translation_models:
-                model_name = self.translation_models[self.current_language]
-                self.tokenizer = MarianTokenizer.from_pretrained(model_name)
-                self._load_translation_model(model_name)
-            else:
-                # Fallback to Spanish model
-                model_name = self.translation_models['es']
-                self.tokenizer = MarianTokenizer.from_pretrained(model_name)
-                self._load_translation_model(model_name)
+            self.tokenizer = AutoTokenizer.from_pretrained(self.nllb_model_name)
+
+            model_kwargs = {"low_cpu_mem_usage": True}
+            # Use float16 on CUDA for better throughput
+            if self.translation_device.type == 'cuda':
+                model_kwargs["torch_dtype"] = torch.float16
+
+            self.model = AutoModelForSeq2SeqLM.from_pretrained(
+                self.nllb_model_name,
+                **model_kwargs,
+            )
+
+            self.model.to(self.translation_device)
+            if self.translation_device.type != 'cuda':
+                # Keep model weights in float32 on CPU/MPS for compatibility
+                self.model = self.model.to(torch.float32)
+
+            self.model.eval()
+
         except Exception as e:
             print(f"Error initializing translation model: {e}")
-
-    def _load_translation_model(self, model_name):
-        """Load translation model onto a safe device/dtype"""
-        if torch.cuda.is_available():
-            device = torch.device('cuda')
-        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-            device = torch.device('mps')
-        else:
-            device = torch.device('cpu')
-
-        # Always keep model in float32 to avoid dtype mismatches across accelerators
-        self.model = MarianMTModel.from_pretrained(model_name)
-        self.model = self.model.to(device)
-        self.model = self.model.to(torch.float32)
-        self.model.eval()
-
-        self.translation_device = device
+            self.tokenizer = None
+            self.model = None
 
     def change_language(self, language_code):
         """Change the OCR and translation language"""
@@ -546,22 +551,41 @@ class OCRWorker(QThread):
     def _translate_fast(self, text):
         """Fast translation with error handling and better accuracy"""
         try:
+            if self.tokenizer is None or self.model is None:
+                return None
+
             # Limit text length for speed while allowing multi-line context
             if len(text) > 400:
                 text = text[:400]
-                
-            # Use better translation parameters for accuracy
-            tokens = self.tokenizer(text, return_tensors="pt", padding=True, truncation=True, max_length=256).to(self.model.device)
-            translated = self.model.generate(
-                **tokens, 
-                max_length=128, 
-                num_beams=3,  # Better quality than 1
-                early_stopping=True, 
-                do_sample=False,
-                temperature=0.7,  # Slightly more creative
-                repetition_penalty=1.1  # Avoid repetition
+
+            source_code = self.nllb_language_codes.get(self.current_language, 'eng_Latn')
+            target_code = 'eng_Latn'
+
+            self.tokenizer.src_lang = source_code
+
+            tokens = self.tokenizer(
+                text,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=256,
             )
-            english_text = self.tokenizer.decode(translated[0], skip_special_tokens=True)
+            tokens = {k: v.to(self.translation_device) for k, v in tokens.items()}
+
+            generation_kwargs = {
+                "max_length": 256,
+                "num_beams": 3,
+                "early_stopping": True,
+                "repetition_penalty": 1.05,
+            }
+
+            if hasattr(self.tokenizer, "lang_code_to_id") and target_code in self.tokenizer.lang_code_to_id:
+                generation_kwargs["forced_bos_token_id"] = self.tokenizer.lang_code_to_id[target_code]
+
+            with torch.no_grad():
+                translated = self.model.generate(**tokens, **generation_kwargs)
+
+            english_text = self.tokenizer.batch_decode(translated, skip_special_tokens=True)[0]
             
             # Clean up the translation
             english_text = english_text.strip()
