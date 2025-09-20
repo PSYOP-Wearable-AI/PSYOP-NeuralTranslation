@@ -1,0 +1,10 @@
+torch>=2.0.0
+torchaudio>=2.0.0
+transformers>=4.30.0
+whisper-openai>=20231117
+easyocr>=1.7.0
+opencv-python>=4.8.0
+PySide6>=6.5.0
+numpy>=1.24.0
+pyaudio>=0.2.11
+wave
