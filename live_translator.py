@@ -1,9 +1,13 @@
 import sys, cv2, torch
 import easyocr
 import numpy as np
+import pyaudio
+import whisper
+import queue
+from collections import deque
 from PySide6.QtWidgets import QApplication, QLabel, QMainWindow, QVBoxLayout, QWidget, QPushButton, QTextEdit, QSlider, QHBoxLayout, QCheckBox, QComboBox
 from PySide6.QtGui import QImage, QPixmap
-from PySide6.QtCore import QTimer, Qt, QThread, Signal, QMutex
+from PySide6.QtCore import QTimer, Qt, QThread, Signal, QMutex, QMutexLocker
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 import time
 import threading
@@ -14,6 +18,13 @@ try:
 except ImportError:
     PaddleOCR = None
     PADDLE_AVAILABLE = False
+
+try:
+    import webrtcvad
+    VAD_AVAILABLE = True
+except ImportError:
+    webrtcvad = None
+    VAD_AVAILABLE = False
 
 # -------------------------------
 # OCR + Translation Worker Thread
@@ -689,6 +700,266 @@ class OCRWorker(QThread):
     def update_confidence_threshold(self, value):
         self.confidence_threshold = value / 100.0
 
+    def translate_text(self, text, language_code=None):
+        return self._translate_fast(text, language_code)
+
+# -------------------------------
+# Audio Capture and Transcription Threads
+# -------------------------------
+class AudioCaptureThread(QThread):
+    """Capture audio from a selected microphone with voice activity detection"""
+
+    segment_ready = Signal(object)
+    device_error = Signal(str)
+    level_changed = Signal(float)
+
+    def __init__(self, device_index=None, sample_rate=16000, parent=None):
+        super().__init__(parent)
+        self.device_index = device_index
+        self.sample_rate = sample_rate
+        self.channels = 1
+        self.chunk_duration = 0.03  # 30ms chunks for responsive VAD
+        self.chunk_size = int(self.sample_rate * self.chunk_duration)
+        self.running = False
+        self.energy_threshold = 350.0
+        self.min_segment_seconds = 1.0
+        self.max_segment_seconds = 12.0
+        self.silence_timeout = 0.7
+        self.pre_roll_seconds = 0.35
+        self._pre_roll = deque(maxlen=int(self.sample_rate * self.pre_roll_seconds))
+        self._current_segment = []
+        self._silence_samples = 0
+        self.use_vad = VAD_AVAILABLE
+        self.vad = webrtcvad.Vad(2) if self.use_vad else None
+
+    def set_device_index(self, index):
+        self.device_index = index
+
+    def set_sensitivity(self, slider_value):
+        """Map slider value (1-100) to an RMS threshold"""
+        slider_value = max(1, min(100, slider_value))
+        min_threshold = 120.0
+        max_threshold = 1200.0
+        # Higher slider value -> more sensitive (lower threshold)
+        ratio = (100 - slider_value) / 99.0
+        self.energy_threshold = min_threshold + (max_threshold - min_threshold) * ratio
+
+    def reset_buffers(self):
+        self._pre_roll.clear()
+        self._current_segment = []
+        self._silence_samples = 0
+
+    def stop(self):
+        self.running = False
+        self.wait()
+
+    def run(self):
+        if self.chunk_size <= 0:
+            self.chunk_size = 480
+
+        pa = pyaudio.PyAudio()
+        stream = None
+        try:
+            device_info = None
+            device_index = self.device_index
+            if device_index is not None:
+                try:
+                    device_info = pa.get_device_info_by_index(device_index)
+                except Exception:
+                    device_info = None
+            if device_info is None:
+                try:
+                    device_info = pa.get_default_input_device_info()
+                    device_index = device_info.get('index')
+                except Exception:
+                    self.device_error.emit("No input device available")
+                    return
+
+            max_channels = int(device_info.get('maxInputChannels', 1)) or 1
+            self.channels = min(2, max_channels)
+
+            stream = pa.open(
+                format=pyaudio.paInt16,
+                channels=self.channels,
+                rate=self.sample_rate,
+                input=True,
+                input_device_index=device_index,
+                frames_per_buffer=self.chunk_size,
+            )
+
+            self.running = True
+            self.reset_buffers()
+
+            while self.running:
+                try:
+                    data = stream.read(self.chunk_size, exception_on_overflow=False)
+                except Exception as e:
+                    self.device_error.emit(str(e))
+                    break
+
+                chunk = np.frombuffer(data, dtype=np.int16)
+                if self.channels > 1:
+                    chunk = chunk.reshape(-1, self.channels).mean(axis=1).astype(np.int16)
+
+                level = self._compute_level(chunk)
+                self.level_changed.emit(level)
+                self._process_chunk(chunk)
+
+        finally:
+            if stream:
+                stream.stop_stream()
+                stream.close()
+            pa.terminate()
+            self.running = False
+
+    def _compute_level(self, audio):
+        if audio.size == 0:
+            return 0.0
+        return float(np.sqrt(np.mean(audio.astype(np.float32) ** 2)))
+
+    def _is_speech(self, audio):
+        if audio.size == 0:
+            return False
+
+        if self.vad is not None:
+            frame_length = int(0.02 * self.sample_rate)  # 20ms
+            bytes_audio = audio.tobytes()
+            for start in range(0, len(bytes_audio) - frame_length * 2 + 1, frame_length * 2):
+                frame = bytes_audio[start:start + frame_length * 2]
+                if self.vad.is_speech(frame, self.sample_rate):
+                    return True
+            return False
+
+        return self._compute_level(audio) >= self.energy_threshold
+
+    def _process_chunk(self, audio):
+        speech = self._is_speech(audio)
+
+        if speech:
+            if not self._current_segment and self._pre_roll:
+                self._current_segment.extend(self._pre_roll)
+            self._current_segment.extend(audio.tolist())
+            self._silence_samples = 0
+            if len(self._current_segment) >= int(self.max_segment_seconds * self.sample_rate):
+                self._emit_segment()
+        else:
+            if self._current_segment:
+                self._silence_samples += len(audio)
+                if self._silence_samples >= int(self.silence_timeout * self.sample_rate):
+                    if len(self._current_segment) >= int(self.min_segment_seconds * self.sample_rate):
+                        self._emit_segment()
+                    self._current_segment = []
+                    self._silence_samples = 0
+            else:
+                # Maintain pre-roll buffer during silence
+                self._pre_roll.extend(audio.tolist())
+
+    def _emit_segment(self):
+        if not self._current_segment:
+            return
+        segment = np.array(self._current_segment, dtype=np.int16)
+        self.segment_ready.emit(segment)
+        self._current_segment = []
+        self._silence_samples = 0
+        self._pre_roll.clear()
+
+
+class WhisperWorker(QThread):
+    """Transcribe buffered audio segments with Whisper and translate using NLLB"""
+
+    transcription_ready = Signal(str, str)
+    translation_ready = Signal(str, str)
+    status_changed = Signal(str)
+    error = Signal(str)
+
+    def __init__(self, translate_callable, language_resolver, parent=None):
+        super().__init__(parent)
+        self.translate_callable = translate_callable
+        self.language_resolver = language_resolver
+        self.segment_queue = queue.Queue()
+        self.running = False
+        self.model = None
+        self.device = self._resolve_device()
+        self.model_size = 'base'
+
+    def _resolve_device(self):
+        if torch.cuda.is_available():
+            return 'cuda'
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            return 'mps'
+        return 'cpu'
+
+    def enqueue_segment(self, segment):
+        if segment is not None:
+            self.segment_queue.put(segment)
+
+    def stop(self):
+        self.running = False
+        self.segment_queue.put(None)
+        self.wait()
+
+    def run(self):
+        self.status_changed.emit("Loading Whisper model...")
+        try:
+            self.model = whisper.load_model(self.model_size, device=self.device)
+        except Exception as e:
+            self.error.emit(f"Whisper load error: {e}")
+            return
+
+        self.status_changed.emit("Listening")
+        self.running = True
+
+        while self.running:
+            try:
+                segment = self.segment_queue.get(timeout=0.2)
+            except queue.Empty:
+                continue
+
+            if segment is None:
+                break
+
+            if segment.size == 0:
+                continue
+
+            audio_float = segment.astype(np.float32) / 32768.0
+
+            language_code = None
+            try:
+                language_code = self.language_resolver()
+            except Exception:
+                language_code = None
+
+            transcription_kwargs = {
+                'fp16': self.device == 'cuda'
+            }
+            if language_code and language_code != 'auto':
+                transcription_kwargs['language'] = language_code
+
+            try:
+                result = self.model.transcribe(audio_float, **transcription_kwargs)
+            except Exception as e:
+                self.error.emit(f"Whisper transcription error: {e}")
+                continue
+
+            text = (result.get("text") or "").strip()
+            detected_language = result.get("language", language_code or "unknown")
+
+            if not text:
+                continue
+
+            self.transcription_ready.emit(text, detected_language)
+
+            try:
+                translation = self.translate_callable(text, language_code or detected_language)
+            except Exception as e:
+                self.error.emit(f"Translation error: {e}")
+                translation = None
+
+            if translation:
+                self.translation_ready.emit(text, translation)
+
+        self.running = False
+        self.status_changed.emit("Audio idle")
 # -------------------------------
 # Main Window
 # -------------------------------
@@ -704,6 +975,8 @@ class MainWindow(QMainWindow):
         self.hud_mode = False
         self.overlay_spanish = ""
         self.overlay_english = ""
+        self.overlay_audio_source = ""
+        self.overlay_audio_english = ""
         self.on_external_display = False
 
         self.text_spanish = QTextEdit()
@@ -713,6 +986,15 @@ class MainWindow(QMainWindow):
         self.text_english.setReadOnly(True)
         self.text_english.setMaximumHeight(80)
 
+        self.audio_transcript = QTextEdit()
+        self.audio_transcript.setReadOnly(True)
+        self.audio_transcript.setMaximumHeight(80)
+        self.audio_translation = QTextEdit()
+        self.audio_translation.setReadOnly(True)
+        self.audio_translation.setMaximumHeight(80)
+        self.audio_transcript_label = QLabel("Audio Transcript:")
+        self.audio_translation_label = QLabel("Audio Translation:")
+
         self.btn_toggle = QPushButton("Pause OCR")
         self.btn_toggle.clicked.connect(self.toggle_ocr)
 
@@ -721,6 +1003,20 @@ class MainWindow(QMainWindow):
 
         self.btn_external_display = QPushButton("Send to External Display")
         self.btn_external_display.clicked.connect(self.toggle_external_display)
+
+        self.btn_audio_toggle = QPushButton("Start Audio Capture")
+        self.btn_audio_toggle.clicked.connect(self.toggle_audio_capture)
+        self.audio_status_label = QLabel("Audio: Idle")
+
+        self.mic_combo = QComboBox()
+        self.mic_combo.currentIndexChanged.connect(self.handle_mic_change)
+
+        self.mic_sensitivity_slider = QSlider(Qt.Horizontal)
+        self.mic_sensitivity_slider.setMinimum(1)
+        self.mic_sensitivity_slider.setMaximum(100)
+        self.mic_sensitivity_slider.setValue(60)
+        self.mic_sensitivity_slider.valueChanged.connect(self.update_mic_sensitivity)
+        self.mic_sensitivity_label = QLabel("Mic Sensitivity: 60")
 
         # Performance controls
         self.confidence_slider = QSlider(Qt.Horizontal)
@@ -785,6 +1081,13 @@ class MainWindow(QMainWindow):
         lang_layout.addWidget(self.language_combo)
         layout.addLayout(lang_layout)
 
+        mic_layout = QHBoxLayout()
+        mic_layout.addWidget(QLabel("Microphone:"))
+        mic_layout.addWidget(self.mic_combo)
+        mic_layout.addWidget(self.mic_sensitivity_label)
+        mic_layout.addWidget(self.mic_sensitivity_slider)
+        layout.addLayout(mic_layout)
+
         # OCR engine selection
         self.ocr_engine_combo = QComboBox()
         self.ocr_engine_combo.addItems(["Automatic", "PaddleOCR", "EasyOCR"])
@@ -806,6 +1109,17 @@ class MainWindow(QMainWindow):
         self.translated_label = QLabel("Translated English:")
         layout.addWidget(self.translated_label)
         layout.addWidget(self.text_english)
+
+        layout.addWidget(self.audio_transcript_label)
+        layout.addWidget(self.audio_transcript)
+        layout.addWidget(self.audio_translation_label)
+        layout.addWidget(self.audio_translation)
+
+        audio_button_layout = QHBoxLayout()
+        audio_button_layout.addWidget(self.btn_audio_toggle)
+        audio_button_layout.addWidget(self.audio_status_label)
+        layout.addLayout(audio_button_layout)
+
         button_row = QHBoxLayout()
         button_row.addWidget(self.btn_toggle)
         button_row.addWidget(self.btn_hud)
@@ -841,6 +1155,11 @@ class MainWindow(QMainWindow):
         self.last_fps_time = 0
         self.fps_counter = 0
         self.processing_status = "Ready"
+
+        self.audio_capture_thread = None
+        self.whisper_thread = None
+        self.populate_microphones()
+        self.update_mic_sensitivity(self.mic_sensitivity_slider.value())
 
     def update_frame(self):
         ret, frame = self.cap.read()
@@ -910,6 +1229,152 @@ class MainWindow(QMainWindow):
         engine_key = mapping.get(text, 'auto')
         self.ocr_worker.change_ocr_engine(engine_key)
 
+    def populate_microphones(self):
+        pa = pyaudio.PyAudio()
+        devices = []
+        try:
+            for index in range(pa.get_device_count()):
+                info = pa.get_device_info_by_index(index)
+                if int(info.get('maxInputChannels', 0)) > 0:
+                    name = info.get('name', f'Device {index}')
+                    channels = int(info.get('maxInputChannels', 1)) or 1
+                    devices.append((name, index, channels))
+        finally:
+            pa.terminate()
+
+        self.mic_combo.blockSignals(True)
+        self.mic_combo.clear()
+        if not devices:
+            self.mic_combo.addItem("System Default", (None, 1))
+        else:
+            preferred_index = 0
+            for pos, (name, _, _) in enumerate(devices):
+                if 'glass' in name.lower():
+                    preferred_index = pos
+                    break
+            for name, idx, channels in devices:
+                display = f"{name} ({channels} ch)"
+                self.mic_combo.addItem(display, (idx, channels))
+            self.mic_combo.setCurrentIndex(preferred_index)
+        self.mic_combo.blockSignals(False)
+
+    def handle_mic_change(self, _index):
+        if self.audio_capture_thread and self.audio_capture_thread.isRunning():
+            self.restart_audio_pipeline()
+
+    def get_current_language_code(self):
+        text = self.language_combo.currentText()
+        if '(' in text and ')' in text:
+            return text.split('(')[1].split(')')[0].strip()
+        return 'auto'
+
+    def translate_audio_text(self, text, language_code=None):
+        lang = language_code or self.get_current_language_code()
+        return self.ocr_worker.translate_text(text, lang)
+
+    def toggle_audio_capture(self):
+        if self.audio_capture_thread and self.audio_capture_thread.isRunning():
+            self.stop_audio_pipeline()
+        else:
+            self.start_audio_pipeline()
+
+    def start_audio_pipeline(self):
+        if self.whisper_thread and self.whisper_thread.isRunning():
+            return
+
+        mic_data = self.mic_combo.currentData()
+        device_index = None
+        if mic_data:
+            device_index = mic_data[0]
+
+        self.whisper_thread = WhisperWorker(self.translate_audio_text, self.get_current_language_code)
+        self.whisper_thread.transcription_ready.connect(self.handle_audio_transcription)
+        self.whisper_thread.translation_ready.connect(self.handle_audio_translation)
+        self.whisper_thread.status_changed.connect(self.update_audio_status)
+        self.whisper_thread.error.connect(self.handle_audio_error)
+        self.whisper_thread.start()
+
+        self.audio_capture_thread = AudioCaptureThread(device_index=device_index)
+        self.audio_capture_thread.set_sensitivity(self.mic_sensitivity_slider.value())
+        self.audio_capture_thread.segment_ready.connect(self.whisper_thread.enqueue_segment)
+        self.audio_capture_thread.device_error.connect(self.handle_audio_error)
+        self.audio_capture_thread.level_changed.connect(self.handle_audio_level)
+        self.audio_capture_thread.start()
+
+        self.btn_audio_toggle.setText("Stop Audio Capture")
+        self.audio_status_label.setText("Audio: Initializing")
+
+    def stop_audio_pipeline(self):
+        if self.audio_capture_thread:
+            if self.whisper_thread:
+                try:
+                    self.audio_capture_thread.segment_ready.disconnect(self.whisper_thread.enqueue_segment)
+                except Exception:
+                    pass
+            try:
+                self.audio_capture_thread.device_error.disconnect(self.handle_audio_error)
+            except Exception:
+                pass
+            try:
+                self.audio_capture_thread.level_changed.disconnect(self.handle_audio_level)
+            except Exception:
+                pass
+            self.audio_capture_thread.stop()
+            self.audio_capture_thread = None
+
+        if self.whisper_thread:
+            try:
+                self.whisper_thread.transcription_ready.disconnect(self.handle_audio_transcription)
+                self.whisper_thread.translation_ready.disconnect(self.handle_audio_translation)
+                self.whisper_thread.status_changed.disconnect(self.update_audio_status)
+                self.whisper_thread.error.disconnect(self.handle_audio_error)
+            except Exception:
+                pass
+            self.whisper_thread.stop()
+            self.whisper_thread = None
+
+        self.btn_audio_toggle.setText("Start Audio Capture")
+        self.audio_status_label.setText("Audio: Idle")
+        self.overlay_audio_source = ""
+        self.overlay_audio_english = ""
+        self.audio_transcript.clear()
+        self.audio_translation.clear()
+
+    def restart_audio_pipeline(self):
+        running = self.audio_capture_thread and self.audio_capture_thread.isRunning()
+        self.stop_audio_pipeline()
+        if running:
+            self.start_audio_pipeline()
+
+    def update_mic_sensitivity(self, value):
+        self.mic_sensitivity_label.setText(f"Mic Sensitivity: {value}")
+        if self.audio_capture_thread:
+            self.audio_capture_thread.set_sensitivity(value)
+
+    def handle_audio_level(self, level):
+        # Placeholder for future visual meters; keep lightweight to avoid UI spam
+        del level
+
+    def handle_audio_transcription(self, text, language):
+        self.audio_transcript.setPlainText(text)
+        self.overlay_audio_source = text
+        del language
+
+    def handle_audio_translation(self, original, translation):
+        del original
+        self.audio_translation.setPlainText(translation)
+        if translation:
+            self.overlay_audio_english = translation
+        else:
+            self.overlay_audio_english = ""
+
+    def update_audio_status(self, message):
+        self.audio_status_label.setText(f"Audio: {message}")
+
+    def handle_audio_error(self, message):
+        self.stop_audio_pipeline()
+        self.audio_status_label.setText(f"Audio error: {message}")
+
     def toggle_smart_processing(self, state):
         """Toggle intelligent processing features"""
         if state == Qt.Checked:
@@ -935,6 +1400,10 @@ class MainWindow(QMainWindow):
         self.text_english.setVisible(not self.hud_mode)
         self.detected_label.setVisible(not self.hud_mode)
         self.translated_label.setVisible(not self.hud_mode)
+        self.audio_transcript_label.setVisible(not self.hud_mode)
+        self.audio_transcript.setVisible(not self.hud_mode)
+        self.audio_translation_label.setVisible(not self.hud_mode)
+        self.audio_translation.setVisible(not self.hud_mode)
 
     def toggle_external_display(self):
         self.on_external_display = not self.on_external_display
@@ -970,6 +1439,10 @@ class MainWindow(QMainWindow):
             hud_lines.append((f"ES: {self.overlay_spanish}", (255, 255, 255)))
         if self.overlay_english:
             hud_lines.append((f"EN: {self.overlay_english}", (0, 255, 0)))
+        if self.overlay_audio_source:
+            hud_lines.append((f"Audio: {self.overlay_audio_source}", (255, 215, 0)))
+        if self.overlay_audio_english:
+            hud_lines.append((f"EN(Audio): {self.overlay_audio_english}", (0, 200, 255)))
 
         if not hud_lines:
             return
@@ -1024,6 +1497,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(f"Field Translator - {language_name}")
 
     def closeEvent(self, event):
+        self.stop_audio_pipeline()
         self.cap.release()
         super().closeEvent(event)
 
